@@ -402,7 +402,10 @@ def validate(rule):
 
 
 def active(rule, today):
-    """A rule with a "date" is watched on that New York date only."""
+    """A rule with a "date" is watched on that New York date only; one with "dates" (a futures
+    session that spans midnight) on each of them."""
+    if rule.get("dates"):
+        return today in [str(d) for d in rule["dates"]]
     return not rule.get("date") or str(rule["date"]) == today
 
 
@@ -513,11 +516,18 @@ def rules_from_plan(plan, cfg_flat_by=None):
     flat = plan.get("flat_by") or cfg_flat_by or "15:55"
     if _hhmm(flat) is None:
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
+    sess = plan.get("session") if isinstance(plan.get("session"), dict) else None
     out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by close", "before_close": True})
+                "label": "flat by close", "before_close": sess is None})
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])
+        if sess and str(sess.get("close", "")) <= str(sess.get("open", "")):
+            # a night session opens the evening before its trade date: watch the stop and target both days
+            d = datetime.date.fromisoformat(str(plan["date"]))
+            for r in out[:2]:
+                r["dates"] = [(d - datetime.timedelta(days=1)).isoformat(), d.isoformat()]
+                del r["date"]
     return out
 
 

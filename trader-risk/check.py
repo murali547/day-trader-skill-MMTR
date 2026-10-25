@@ -62,6 +62,10 @@ reward:risk rules work in dollars as for a stock. min_order_usd, max_order_usd
 and max_position_pct are skipped (they measure what shares cost, not a
 contract's margin). The cash rule uses "futures_margin_usd" from the config
 when it names the contract, and warns that margin is unchecked when not.
+A futures order whose plan has a "session" (globex, asia, london, comex or
+your own) gets that session's window instead of the NYSE one: open on a
+weekday trade date that is not an NYSE holiday, no entries in its first 15
+minutes or its last 30.
 
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
@@ -256,6 +260,37 @@ def window_check(now_et, c):
         return ["window: no new entries after %s New York (it is %s)" % (after.strftime("%H:%M"),
                                                                          t.strftime("%H:%M"))], warns
     return [], warns
+
+
+def session_window_check(now_et, sess):
+    """Reasons a futures entry cannot be placed now, for an order whose plan names a session
+    {"name", "open", "close", "minutes"}: the session's trade date (the day it closes) must be a
+    trading day, and no entries in its first 15 minutes or its last 30."""
+    try:
+        cm = int(sess["close"][:2]) * 60 + int(sess["close"][3:])
+        length = int(sess["minutes"])
+    except (KeyError, TypeError, ValueError):
+        return ["window: the order's session %r is not readable; make the plan again with trader-exit" % (sess,)]
+    stamp = now_et.strftime("%a %Y-%m-%d %H:%M")
+    span = "%s session, %s to %s New York" % (sess.get("name", "futures"), sess.get("open"), sess.get("close"))
+    for k in range(-1, 3):
+        d = now_et.date() + datetime.timedelta(days=k)
+        close_dt = datetime.datetime.combine(d, datetime.time(cm // 60, cm % 60))
+        open_dt = close_dt - datetime.timedelta(minutes=length)
+        if open_dt <= now_et < close_dt:
+            ok, why = trading_day(d)
+            if not ok:
+                return ["window: no %s on %s (%s; it is %s New York)" % (span, d.isoformat(), why, stamp)]
+            first = open_dt + datetime.timedelta(minutes=15)
+            last = close_dt - datetime.timedelta(minutes=30)
+            if now_et < first:
+                return ["window: no new entries before %s, 15 minutes into the %s (it is %s)"
+                        % (first.strftime("%H:%M"), span, now_et.strftime("%H:%M"))]
+            if now_et > last:
+                return ["window: no new entries after %s, 30 minutes before the %s closes (it is %s)"
+                        % (last.strftime("%H:%M"), span, now_et.strftime("%H:%M"))]
+            return []
+    return ["window: the %s is closed (%s New York)" % (span, stamp)]
 
 
 def business_days(today, n=5):
@@ -668,7 +703,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
+            if spec and isinstance(plan.get("session"), dict):
+                later.extend(session_window_check(now_et, plan["session"]))
+            else:
+                later.extend(win_reasons)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
@@ -730,7 +768,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held - value / ref
         results.append({
             "index": i, "symbol": sym, "side": side, "kind": kind,
-            "amount": money(_f(notional) or 0) if notional is not None else ("%s %ss" % (qty, unit)),
+            "amount": money(_f(notional) or 0) if notional is not None else ("%s %s%s" % (qty, unit, "" if str(qty) == "1" else "s")),
             "value_usd": round(value, 2) if value is not None else None,
             "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,

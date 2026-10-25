@@ -333,6 +333,28 @@ def money(x):
 
 # ---------------------------------------------------------------- plan mode (the default)
 
+def session_trade_date(spec, local):
+    """The trade date (the day it closes) of a plan's futures session at New York time `local`:
+    the session open now, else the one opening later today, else the one that closed today."""
+    om = int(spec["open"][:2]) * 60 + int(spec["open"][3:])
+    cm = int(spec["close"][:2]) * 60 + int(spec["close"][3:])
+    length = (cm - om) % 1440 or 1440
+    cands = []
+    for k in range(-1, 3):
+        d = local.date() + datetime.timedelta(days=k)
+        if d.weekday() < 5:
+            close_dt = datetime.datetime.combine(d, datetime.time(cm // 60, cm % 60))
+            cands.append((d, close_dt - datetime.timedelta(minutes=length), close_dt))
+    for c in cands:
+        if c[1] <= local < c[2]:
+            return c[0]
+    for c in cands:
+        if c[1] > local and c[1].date() == local.date():
+            return c[0]
+    past = [c for c in cands if c[2] <= local and c[2].date() == local.date()]
+    return past[-1][0] if past else local.date()
+
+
 def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None):
     """Pure function: one plan + your rules -> the sizing (a dict). qty may be 0.
 
@@ -515,7 +537,7 @@ def _size_future(plan, c, sym, spec, budget, buf_pct, cash_buffer, available, ca
         "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
         "contract": dict(spec, symbol=sym), "risk_per_contract_usd": per_c / 100.0,
-        "margin_per_contract": margin, "margin_note": margin_note,
+        "margin_per_contract": margin, "margin_note": margin_note, "session": plan.get("session"),
     }
 
 
@@ -571,6 +593,9 @@ def _future_order(s):
                  "point_value": k["point_value"], "max_loss": s["max_loss"], "setup": s["setup"],
                  "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
     })
+    if s.get("session"):
+        o["plan"]["session"] = s["session"]
+        o["plan"]["date"] = s["date"]
     return o
 
 
@@ -956,6 +981,8 @@ def run_plan(a, cfg):
     now = parse_now(a.now)
     today = to_eastern(now).date().isoformat()
     plan = read_json(a.plan, "plan (run trader-exit first, or use --weights for a split)")
+    if isinstance(plan, dict) and isinstance(plan.get("session"), dict):
+        today = session_trade_date(plan["session"], to_eastern(now)).isoformat()
     limit = None
     if a.limit is not None:
         if a.limit == "plan":

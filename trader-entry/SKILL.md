@@ -73,6 +73,22 @@ day bar by bar without waiting.
   triggered, expired, or no data. Before 9:30: not open yet. Before 9:45: the
   range is still forming. Weekends and NYSE holidays: the market is closed.
 
+## Futures sessions
+
+For `NQ=F`, `MNQ=F`, `GC=F` and `MGC=F`, `--session` picks the open the
+opening range starts at: `ny` (09:30, the default), `globex` (18:00-17:00),
+`asia` (18:00-03:00), `london` (03:00-09:30), `comex` (08:20-13:30) or your
+own `HH:MM-HH:MM`, all New York time. A session's trade date is the day it
+closes, so Sunday's 6 PM open is Monday's session and its bars run past
+midnight. No entries in its first 15 minutes or last 30. entry.json keeps
+the session, and trader-exit, the Time Machine, trader-budget, trader-risk
+and trader-alerts follow it. A stock with `--session` is refused.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check MNQ=F --session asia --write
+python3 "${CLAUDE_SKILL_DIR}/entry.py" watch GC=F --session london
+```
+
 ## Steps
 
 1. Get the symbol from the user, or run `entry.py watchlist` after

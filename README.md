@@ -181,11 +181,34 @@ python3 trader-broker/ticket.py show                                   # a MANUA
 - **Placing it.** Alpaca does not trade futures, so the ticket is never
   READY: once trader-risk passes it, it shows MANUAL, with the contract,
   the bracket and the max loss for you to place at your futures broker.
-- **The session.** Every tool looks at 9:30 to 4:00 New York time and the
-  NYSE calendar, even though the contracts trade nearly around the clock.
-  Gold's own day opens at 8:20, so a 9:30 range on GC is the stock market's
-  open, not gold's. The scanner, news, analyst and Pelosi tools are for
-  stocks only.
+- **Sessions.** `--session` on trader-entry (the plan, the order and the
+  alerts carry it from there) picks the open the opening range starts at:
+
+  | session | New York time | what it is |
+  | --- | --- | --- |
+  | `ny` (default) | 09:30-16:00 | the stock market's open |
+  | `globex` | 18:00-17:00 | CME's whole day from the 6 PM reopen (5 PM Chicago) |
+  | `asia` | 18:00-03:00 | the evening reopen to London |
+  | `london` | 03:00-09:30 | London to the New York open |
+  | `comex` | 08:20-13:30 | gold's day session |
+  | `HH:MM-HH:MM` | yours | e.g. `20:00-03:00` |
+
+  A session's trade date is the day it closes, as CME counts it: Sunday's
+  6 PM open is Monday's session, and its bars run across midnight. No
+  entries in a session's first 15 minutes or its last 30; flat by 5 minutes
+  before it closes. The NYSE holiday list stands in for CME's, and the times
+  are fixed New York times (London's open moves an hour in the weeks the US
+  and UK change clocks on different dates: use `--session 04:00-09:30`
+  then). The Time Machine replays the same session from the last 60 days,
+  counting a session with a few quiet bars missing as full.
+
+  ```bash
+  python3 trader-entry/entry.py check MNQ=F --session asia --write      # Sunday 6 PM onward
+  python3 trader-exit/exit.py plan --stop or-mid --target 1R --write    # flat by 02:55
+  python3 trader-timemachine/timemachine.py run --write                 # replays 18:00-03:00
+  ```
+
+  The scanner, news, analyst and Pelosi tools are for stocks only.
 
 ## Fine print
 

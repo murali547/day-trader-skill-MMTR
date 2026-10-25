@@ -78,6 +78,11 @@ target rounds half up to it. The plan carries `contract` and
 `risk_per_contract_usd`, and the risk reads as "73.5 points x $20.00 a
 point = $1,470.00 a contract".
 
+A futures entry.json made with `--session` (or `--session` here) keeps its
+session: the trade date is the day the session closes, flat_by defaults to
+5 minutes before that close (02:55 for asia, 16:55 for globex), and an
+entry or flat_by outside the session is refused.
+
 ## Steps
 
 1. Run it right after `/trader-entry` triggers. Before that, `--entry PRICE`

@@ -96,6 +96,17 @@ not in the data (wrong date, not closed yet, a future day), or when the plan
 does not make sense (a stop above a buy's entry, an entry off the 5-minute
 grid). A live in-progress bar is never used.
 
+## Futures sessions
+
+A plan with a `session` (from trader-entry `--session`, or `--session` here)
+replays that session instead of 9:30 to 4:00: for example asia's 108 bars
+from 18:00 to 03:00, grouped by trade date (the day the session closes), so
+a night session's bars run across midnight. A past futures session with up
+to 5 % of its bars missing still counts, each gap a flat bar at the last
+close, and the report says how many were filled. Write night times in
+24-hour form with the leading zero (`--until 02:55`): a bare `2:55` reads as
+p.m.
+
 ## Steps
 
 1. Make sure `trader/plan.json` is today's plan from `/trader-exit`. If there
