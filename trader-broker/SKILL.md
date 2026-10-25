@@ -191,6 +191,16 @@ card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
 
+## Futures
+
+An order with `"asset_class": "future"` (from trader-budget for `NQ=F`,
+`MNQ=F`, `GC=F` or `MGC=F`) is never READY. Alpaca does not trade futures,
+and this pack has no futures connector. Once trader-risk passes it, the
+ticket says MANUAL and shows the contract, the bracket and the max loss in
+dollars. Tell the user to place it themselves at their futures broker, and
+to check the front-month price there first. Do not call place_stock_order
+for it.
+
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.

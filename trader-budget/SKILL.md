@@ -126,6 +126,17 @@ more than the $50 max loss: no order. At 10:52 the real quote was 366.48, so
 the same plan sizes to 6 shares at 8.16 a share, and reward:risk falls to
 0.44: refused, because the move it was waiting for has mostly happened.
 
+## Futures
+
+A plan for `NQ=F`, `MNQ=F`, `GC=F` or `MGC=F` is sized in whole contracts.
+One contract risks (entry minus stop) x its dollars a point ($20 NQ, $2
+MNQ, $100 GC, $10 MGC). The limits are the max loss, `max_contracts`
+(default 1) and, if the config has `"futures_margin_usd": {"MNQ": 2500}`,
+the margin against the cash after the buffer. Without a margin, say plainly
+that it was not checked. A full-size contract that does not fit the max
+loss is refused, and the refusal names the micro. The order carries
+`"asset_class": "future"`: it is for the user's futures broker, not Alpaca.
+
 ## Weights mode (kept from v1)
 
 `--weights AAPL=22.04,KO=10.86` or `--targets FILE` (`targets.example.json`

@@ -102,6 +102,16 @@ Warnings do not block, but say them to the user: a LIVE account, a number
 sent as a number instead of a string, a stop that lives only in the plan and
 not at the broker, a price too old to use, an early close today.
 
+## Futures
+
+An order with a futures symbol (`NQ=F`, `MNQ=F`, `GC=F`, `MGC=F`) is
+blocked unless the config has `"allow_futures": true`. Any other `=F`
+symbol is blocked: the pack has no contract specs for it. The loss is
+contracts x points x dollars a point, so max loss, daily loss and
+reward:risk work in dollars. Min order, max order and the position cap are
+skipped. Cash uses `futures_margin_usd` when the config names the contract,
+and warns that margin was not checked when it does not.
+
 ## Steps
 
 1. If the price may have moved since the plan, refresh it first

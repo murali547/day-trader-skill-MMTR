@@ -70,6 +70,14 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   win or lose, no overnight hold. On a 1:00 p.m. early close it moves up to
   12:55. An entry at or after the flat-by time is refused.
 
+## Futures
+
+For `NQ=F`, `MNQ=F`, `GC=F` and `MGC=F`, the stop rounds down to the
+contract's tick (0.25 for the Nasdaq contracts, 0.10 for gold) and the
+target rounds half up to it. The plan carries `contract` and
+`risk_per_contract_usd`, and the risk reads as "73.5 points x $20.00 a
+point = $1,470.00 a contract".
+
 ## Steps
 
 1. Run it right after `/trader-entry` triggers. Before that, `--entry PRICE`
