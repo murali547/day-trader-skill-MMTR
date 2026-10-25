@@ -35,6 +35,13 @@ the same 9:30 to 4:00 New York session. Prices snap to the tick (0.25 for
 the Nasdaq contracts, 0.10 for gold) and the plan carries the contract's
 dollars a point, so the risk reads in points and in dollars a contract.
 
+Futures sessions: a plan from an entry.json made with --session (or
+--session here) keeps that session. Its trade date is the day the session
+closes, flat_by defaults to 5 minutes before the session's close (16:55 for
+globex, 02:55 for asia) and an entry or flat_by outside the session is
+refused. Sessions: ny (default), globex 18:00-17:00, asia 18:00-03:00,
+london 03:00-09:30, comex 08:20-13:30, or HH:MM-HH:MM.
+
 flat_by (default 15:55, or "flat_by" in trader/config.json): out by then, win
 or lose. On a 1:00 p.m. early close it moves up with the close (12:55).
 "min_reward_risk" in the config (default 1.0) only warns here; trader-risk
@@ -104,6 +111,14 @@ NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET
 OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
+# Futures sessions, New York time (open, close). A session that closes "before" it opens spans midnight.
+SESSIONS = {
+    "ny": ("09:30", "16:00"),
+    "globex": ("18:00", "17:00"),
+    "asia": ("18:00", "03:00"),
+    "london": ("03:00", "09:30"),
+    "comex": ("08:20", "13:30"),
+}
 
 
 class PlanError(Exception):
@@ -202,6 +217,55 @@ def session(d):
     if d.weekday() >= 5 or d.isoformat() in NYSE_HOLIDAYS:
         return None
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
+
+
+def parse_session(text):
+    """"asia", "20:00-03:00" or a saved session dict -> {"name", "open", "close", "minutes"};
+    "ny" or None -> None (stock hours)."""
+    if isinstance(text, dict):
+        text = text.get("name") if text.get("name") in SESSIONS else "%s-%s" % (text.get("open"), text.get("close"))
+    t = str(text or "ny").strip().lower()
+    if t == "ny":
+        return None
+    if t in SESSIONS:
+        o, c = SESSIONS[t]
+    else:
+        m = re.match(r"^(\d{1,2}:\d{2})-(\d{1,2}:\d{2})$", t)
+        if not m:
+            raise PlanError("--session is %s, or your own as HH:MM-HH:MM (got %r)" % (", ".join(SESSIONS), text))
+        o, c = hm(parse_hhmm(m.group(1), "--session")), hm(parse_hhmm(m.group(2), "--session"))
+        t = "custom"
+    om, cm = (int(x[:2]) * 60 + int(x[3:]) for x in (o, c))
+    return {"name": t, "open": o, "close": c, "minutes": (cm - om) % 1440 or 1440}
+
+
+def session_window(spec, trade_date):
+    """(open, close) New York datetimes of a futures session on its trade date (the day it closes)."""
+    close_dt = datetime.datetime.combine(trade_date, parse_hhmm(spec["close"], "close"))
+    return close_dt - datetime.timedelta(minutes=spec["minutes"]), close_dt
+
+
+def session_at(local, spec):
+    """The trade date of the futures session open at New York time `local`, else the one that opens
+    later today, else the one that closed earlier today, else today."""
+    cands = []
+    for k in range(-1, 3):
+        d = local.date() + datetime.timedelta(days=k)
+        if session(d):
+            cands.append((d,) + session_window(spec, d))
+    for c in cands:
+        if c[1] <= local < c[2]:
+            return c[0]
+    for c in cands:
+        if c[1] > local and c[1].date() == local.date():
+            return c[0]
+    past = [c for c in cands if c[2] <= local and c[2].date() == local.date()]
+    return past[-1][0] if past else local.date()
+
+
+def session_offset(t, spec):
+    """Minutes from a futures session's open to New York clock time t (wrapping past midnight)."""
+    return (t.hour * 60 + t.minute - int(spec["open"][:2]) * 60 - int(spec["open"][3:])) % 1440
 
 
 # ---------------------------------------------------------------- money math (Decimal, to the cent)
@@ -465,14 +529,18 @@ def load_chart(sym, interval, day, offline=None):
     return {"bars": bars, "data_time": meta.get("regularMarketTime")}
 
 
-def session_bars(chart, day, interval, upto_slot=None, now_utc=None):
-    """Closed, on-grid bars of one New York session, oldest first (the live tick is dropped)."""
+def session_bars(chart, day, interval, upto_slot=None, now_utc=None, spec=None):
+    """Closed, on-grid bars of one New York session, oldest first (the live tick is dropped).
+    spec: a futures session (its trade date is `day`); None = the NYSE day."""
     step = INTERVALS[interval]
     s = session(day)
     if not s:
         return []
-    open_dt = datetime.datetime.combine(day, s[0])
-    close_dt = datetime.datetime.combine(day, s[1])
+    if spec:
+        open_dt, close_dt = session_window(spec, day)
+    else:
+        open_dt = datetime.datetime.combine(day, s[0])
+        close_dt = datetime.datetime.combine(day, s[1])
     if now_utc is None and chart.get("data_time"):
         now_utc = utc_of(chart["data_time"])
     local = to_eastern(now_utc) if now_utc else None
@@ -481,7 +549,7 @@ def session_bars(chart, day, interval, upto_slot=None, now_utc=None):
         if b["t"] % step:
             continue
         et = to_eastern(utc_of(b["t"]))
-        if et.date() != day or not (open_dt <= et < close_dt):
+        if not (open_dt <= et < close_dt):
             continue
         if local and et + datetime.timedelta(seconds=step) > local:
             continue
@@ -528,6 +596,22 @@ def read_config(path):
     return cfg
 
 
+def session_flat_by(day, spec, explicit, entry_time):
+    """(HH:MM, note) for a futures session: 5 minutes before its close unless --flat-by says otherwise."""
+    _, close_dt = session_window(spec, day)
+    t = parse_hhmm(explicit, "--flat-by") if explicit else (close_dt - datetime.timedelta(minutes=5)).time()
+    span = "%s session (%s to %s)" % (spec["name"], spec["open"], spec["close"])
+    if not 0 < session_offset(t, spec) < spec["minutes"]:
+        raise PlanError("--flat-by %s is outside the %s" % (hm(t), span))
+    if entry_time:
+        if session_offset(entry_time, spec) >= spec["minutes"]:
+            raise PlanError("the entry at %s is outside the %s" % (ampm(entry_time), span))
+        if session_offset(entry_time, spec) >= session_offset(t, spec):
+            raise PlanError("the entry at %s is at or after your flat-by %s: there is no time left to hold it"
+                            % (ampm(entry_time), hm(t)))
+    return hm(t), "" if explicit else "5 minutes before the %s close" % span
+
+
 def resolve_flat_by(day, explicit, cfg, entry_time):
     """(HH:MM, note). The config's flat-by moves up with a 1:00 p.m. early close."""
     t = parse_hhmm(explicit or cfg.get("flat_by") or DEFAULTS["flat_by"], "--flat-by" if explicit else "flat_by")
@@ -563,7 +647,8 @@ def gather(a):
             raise PlanError("give both --or-high and --or-low, or neither")
         info = {"symbol": a.symbol.upper(), "entry": a.entry, "setup": a.setup or ("orb" if a.or_high is not None else "level"),
                 "date": a.date, "entry_time": a.time, "entry_bar": a.entry_bar, "interval": a.interval or "5m",
-                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags"}
+                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags",
+                "session": parse_session(a.session)}
     else:
         path = a.from_path or "trader/entry.json"
         doc = read_json(path, "entry (run /trader-entry first, or give --symbol and --entry)")
@@ -580,7 +665,8 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path}
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path,
+                "session": parse_session(a.session if a.session else doc.get("session"))}
         if not info["symbol"] or info["entry"] is None:
             raise PlanError("%s has no symbol or price" % path)
     if info["interval"] not in INTERVALS:
@@ -605,13 +691,16 @@ def build_plan(a, now_utc):
             day = datetime.date.fromisoformat(str(info["date"]))
         except ValueError:
             raise PlanError("date wants YYYY-MM-DD, not %r" % info["date"])
+    elif info["session"]:
+        day = session_at(to_eastern(now_utc), info["session"])
     else:
         day = to_eastern(now_utc).date()
     entry_time = parse_clock(info["entry_time"], "the entry time") if info["entry_time"] else None
     atr = atr_n = None
     if stop_rule == "atr":
         chart = load_chart(info["symbol"], info["interval"], day, a.offline)
-        bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None)
+        bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None,
+                            info["session"])
         if len(bars) < 3:
             raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
                             % (info["interval"], info["symbol"], day, len(bars)))
@@ -619,7 +708,10 @@ def build_plan(a, now_utc):
     spec = FUTURES.get(info["symbol"])
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
                 atr, atr_n, tick=spec["tick"] if spec else None)
-    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
+    if info["session"]:
+        flat_by, flat_note = session_flat_by(day, info["session"], a.flat_by, entry_time)
+    else:
+        flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(cents(info["or_high"])), "low": float(cents(info["or_low"])),
@@ -632,6 +724,8 @@ def build_plan(a, now_utc):
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+    if info["session"]:
+        plan["session"] = info["session"]
     if spec:
         plan["contract"] = dict(spec, symbol=info["symbol"])
         plan["risk_per_contract_usd"] = float((c["risk"] * D(spec["point_value"])).quantize(CENT))
@@ -648,7 +742,7 @@ def build_plan(a, now_utc):
                             % (ratio(c["reward_risk"]), num(D(mrr))))
     except PlanError:
         pass
-    today = to_eastern(now_utc).date()
+    today = session_at(to_eastern(now_utc), info["session"]) if info["session"] else to_eastern(now_utc).date()
     if day != today:
         warnings.append("This plan is for %s, not today (%s)." % (day.isoformat(), today.isoformat()))
     return plan, warnings
@@ -679,7 +773,13 @@ def describe(plan):
     else:
         out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"]), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
-    out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
+    if plan.get("session"):
+        ss = plan["session"]
+        out.append("  Session       %s, %s to %s New York (trade date %s)" % (ss["name"], ss["open"], ss["close"],
+                                                                           plan["date"]))
+        out.append("  Flat by       %s ET, win or lose: out before the session closes" % plan["flat_by"])
+    else:
+        out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
     out.append(NOTE)
     return out
@@ -746,6 +846,7 @@ def main(argv=None):
     p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM New York (default: config flat_by, 15:55)")
+    p.add_argument("--session", help="futures: ny (default), globex, asia, london, comex or HH:MM-HH:MM")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
     p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
