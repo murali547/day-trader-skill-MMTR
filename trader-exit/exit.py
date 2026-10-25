@@ -10,7 +10,8 @@ It never places an order.
     python3 exit.py plan --symbol NVDA --entry 190.25 --setup level --stop pct:1
     python3 exit.py show                                    # the current trader/plan.json
 
-Stops (a long's stop rounds DOWN to the cent, away from the entry):
+Stops (a long's stop rounds DOWN to the cent, away from the entry; for a
+future, down to the contract's tick):
   or-mid     the opening-range midpoint (the default for an orb entry)
   or-low     the opening-range low
   price:X    your price
@@ -20,7 +21,7 @@ Stops (a long's stop rounds DOWN to the cent, away from the entry):
              bars by then it averages all of them and says so.
   A level setup has no opening-range default: give a stop.
 
-Targets (round half up to the cent):
+Targets (round half up to the cent, or to the tick for a future):
   2R (default), 1R, 1.5R ...   entry + R x risk, where risk = entry - stop
   price:X                      your price
 
@@ -28,6 +29,11 @@ Refused, with the reason: a stop at or above the entry, a target at or below
 it, a risk under 0.05% of the price (too tight to survive the spread), an
 entry.json that has not triggered (unless you give --entry), a short (v2
 plans longs only).
+
+Futures: NQ=F, MNQ=F, GC=F and MGC=F (Yahoo's continuous contracts) plan on
+the same 9:30 to 4:00 New York session. Prices snap to the tick (0.25 for
+the Nasdaq contracts, 0.10 for gold) and the plan carries the contract's
+dollars a point, so the risk reads in points and in dollars a contract.
 
 flat_by (default 15:55, or "flat_by" in trader/config.json): out by then, win
 or lose. On a 1:00 p.m. early close it moves up with the close (12:55).
@@ -58,6 +64,13 @@ DEFAULTS = {"flat_by": "15:55", "min_reward_risk": 1.0}
 ATR_BARS = 14
 MIN_RISK_PCT = Decimal("0.05")     # risk under 0.05% of the price is inside the spread's noise
 CENT = Decimal("0.01")
+# Futures by Yahoo symbol: dollars per 1.00 of price and the minimum tick (CME and COMEX specs).
+FUTURES = {
+    "NQ=F": {"root": "NQ", "name": "E-mini Nasdaq-100", "point_value": 20.0, "tick": 0.25},
+    "MNQ=F": {"root": "MNQ", "name": "Micro E-mini Nasdaq-100", "point_value": 2.0, "tick": 0.25},
+    "GC=F": {"root": "GC", "name": "Gold", "point_value": 100.0, "tick": 0.10},
+    "MGC=F": {"root": "MGC", "name": "Micro Gold", "point_value": 10.0, "tick": 0.10},
+}
 EPOCH = datetime.datetime(1970, 1, 1)
 NOTE = "A stop is a plan, not a guarantee: a gap or a fast market can fill past it."
 
@@ -212,6 +225,18 @@ def floor_cents(x):
     return D(x).quantize(CENT, rounding=ROUND_FLOOR)
 
 
+def floor_tick(x, tick):
+    """A long's stop on a future: down to the tick, away from the entry."""
+    t = D(tick)
+    return ((D(x) / t).to_integral_value(rounding=ROUND_FLOOR) * t).quantize(CENT)
+
+
+def round_tick(x, tick):
+    """A future's target: half up to the tick."""
+    t = D(tick)
+    return ((D(x) / t).to_integral_value(rounding=ROUND_HALF_UP) * t).quantize(CENT)
+
+
 def money(x):
     return "$%s" % format(D(x).quantize(CENT), ",f")
 
@@ -268,8 +293,9 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None):
-    """The stop, the target and the risk, in exact cents. Raises PlanError with the reason."""
+            atr=None, atr_bars=None, tick=None):
+    """The stop, the target and the risk, in exact cents (on the tick when tick is
+    given, for a future). Raises PlanError with the reason."""
     e = cents(entry)
     if e <= 0:
         raise PlanError("the entry price must be above $0")
@@ -302,7 +328,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
             num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
-    stop = floor_cents(raw)
+    stop = floor_tick(raw, tick) if tick else floor_cents(raw)
     if stop != D(raw):
         detail = (detail + ", rounded down" if detail else "$%s rounded down" % num(raw))
     if stop >= e:
@@ -317,10 +343,10 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
                         "survive the spread, normal wiggle would stop you out. Widen it."
                         % (money(risk), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP)), money(e)))
     if target_rule == "r":
-        target = cents(e + target_param * risk)
+        target = round_tick(e + target_param * risk, tick) if tick else cents(e + target_param * risk)
         t_label = r_label(target_param)
     else:
-        target = cents(target_param)
+        target = round_tick(target_param, tick) if tick else cents(target_param)
         t_label = None
     if target <= e:
         raise PlanError("the target %s is at or below the entry %s: a long's target goes above it"
@@ -590,8 +616,9 @@ def build_plan(a, now_utc):
             raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
                             % (info["interval"], info["symbol"], day, len(bars)))
         atr, atr_n = atr_of(bars)
+    spec = FUTURES.get(info["symbol"])
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
-                atr, atr_n)
+                atr, atr_n, tick=spec["tick"] if spec else None)
     flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
@@ -605,6 +632,9 @@ def build_plan(a, now_utc):
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+    if spec:
+        plan["contract"] = dict(spec, symbol=info["symbol"])
+        plan["risk_per_contract_usd"] = float((c["risk"] * D(spec["point_value"])).quantize(CENT))
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
@@ -641,7 +671,13 @@ def describe(plan):
     out.append("  Stop          %s  %s%s" % (money(plan["stop"]), plan["stop_label"],
                                              (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
     out.append("  Target        %s  %s" % (money(plan["target"]), plan["target_label"]))
-    out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"]), pct))
+    k = plan.get("contract")
+    if k:
+        out.append("  Risk          %s points x %s a point = %s a contract (%s%% of the entry)"
+                   % (num(risk), money(k["point_value"]), money(risk * D(k["point_value"])), pct))
+        out.append("  Contract      %s (%s), tick %s" % (k["root"], k["name"], num(D(k["tick"]))))
+    else:
+        out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"]), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
     out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")

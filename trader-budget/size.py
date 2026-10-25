@@ -29,6 +29,24 @@ bigger loss at the same stop. Zero shares (the stop is too far away for your
 max loss) is a plain refusal: no order is written. So is a reward:risk under
 min_reward_risk (the price ran toward the target since the plan).
 
+Futures (NQ=F, MNQ=F, GC=F, MGC=F, Yahoo's symbols): sized in whole
+contracts. One contract risks (entry minus stop) x the contract's dollars a
+point: $20 for NQ, $2 for MNQ, $100 for GC, $10 for MGC.
+
+    contracts = floor of the smallest of
+      max loss       max_loss_per_trade_usd / risk per contract
+      max contracts  max_contracts (default 1)
+      margin         (budget minus the cash buffer) / your broker's margin for
+                     the contract, from "futures_margin_usd" in the config,
+                     e.g. {"MNQ": 2500}. Margins change, so the pack ships none:
+                     without one the margin is not checked and it says so.
+
+Position cap and max order are left out for a future: they measure what a
+share costs, and a contract's face value (price x dollars a point) is not
+what you pay to hold it. The order is written for your futures broker, not
+Alpaca (Alpaca does not trade futures); trader-broker shows it as a manual
+ticket.
+
 Weights mode (kept from v1, no longer the headline): split a budget across a
 list of stocks by weight.
 
@@ -85,6 +103,14 @@ DEFAULTS = {
 }
 EPS = 1e-9
 FRESH_MINUTES = 15
+# Futures by Yahoo symbol: dollars per 1.00 of price and the minimum tick (CME and COMEX specs).
+FUTURES = {
+    "NQ=F": {"root": "NQ", "name": "E-mini Nasdaq-100", "point_value": 20.0, "tick": 0.25},
+    "MNQ=F": {"root": "MNQ", "name": "Micro E-mini Nasdaq-100", "point_value": 2.0, "tick": 0.25},
+    "GC=F": {"root": "GC", "name": "Gold", "point_value": 100.0, "tick": 0.10},
+    "MGC=F": {"root": "MGC", "name": "Micro Gold", "point_value": 10.0, "tick": 0.10},
+}
+MICRO = {"NQ=F": "MNQ=F", "GC=F": "MGC=F"}
 SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce"}
 
 
@@ -293,6 +319,11 @@ def _num(x):
     return "%.2f" % x
 
 
+def _pts(x):
+    """73.5 -> "73.5", 4.7 -> "4.7": futures points, no trailing zeros."""
+    return ("%.4f" % float(x)).rstrip("0").rstrip(".")
+
+
 def money(x):
     x = float(x)
     if abs(x - round(x)) < 0.005:
@@ -328,8 +359,12 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             raise SizeError("the plan needs a positive %s (run trader-exit); a bracket order needs entry, "
                             "stop and target" % name)
     blocked = {str(b).upper() for b in (c.get("blocked") or [])}
-    if sym in blocked:
+    spec = FUTURES.get(sym)
+    if sym in blocked or (spec and spec["root"] in blocked):
         raise SizeError("%s is on your blocked list" % sym)
+    if spec is None and sym.endswith("=F"):
+        raise SizeError("%s is a future this pack has no contract specs for; it knows %s"
+                        % (sym, ", ".join(sorted(FUTURES))))
 
     budget = float(budget if budget is not None else (c.get("budget") or 0))
     if budget <= 0:
@@ -362,6 +397,9 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         available = cash - cash_buffer
         cash_note = "cash %s in trader/portfolio.json minus the %s buffer" % (money(cash), money(cash_buffer))
     available = max(round(available, 2), 0.0)
+    if spec:
+        return _size_future(plan, c, sym, spec, budget, buf_pct, cash_buffer, available, cash_note,
+                            entry_plan, ref, ref_from, stop, target, risk_c, reward_c, limit)
 
     limits = []
     max_loss = _f(c.get("max_loss_per_trade_usd"))
@@ -415,10 +453,79 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     }
 
 
+def _size_future(plan, c, sym, spec, budget, buf_pct, cash_buffer, available, cash_note,
+                 entry_plan, ref, ref_from, stop, target, risk_c, reward_c, limit):
+    """size_trade for a futures plan: whole contracts, risk in points x dollars a point."""
+    pv = spec["point_value"]
+    risk = risk_c / 100.0
+    per_c = int(round(risk_c * pv))                  # one contract's risk, in cents
+    limits = []
+    max_loss = _f(c.get("max_loss_per_trade_usd"))
+    if max_loss:
+        n = int(round(max_loss * 100)) // per_c if per_c > 0 else 0
+        limits.append({"name": "max loss", "usd": max_loss, "per": per_c / 100.0, "shares": n,
+                       "how": "%s max loss / %s risk a contract (%s points x %s)"
+                              % (money(max_loss), money(per_c / 100.0), _pts(risk), money(pv))})
+    max_n = int(_f(c.get("max_contracts")) or 1)
+    limits.append({"name": "max contracts", "usd": None, "per": None, "shares": max_n,
+                   "how": "max_contracts in your config"})
+    margins = c.get("futures_margin_usd") or {}
+    margin = _f(margins.get(spec["root"], margins.get(sym))) if isinstance(margins, dict) else None
+    margin_note = None
+    if margin and margin > 0:
+        limits.append({"name": "margin", "usd": available, "per": margin, "shares": shares_for(available, margin),
+                       "how": "%s = %s / %s margin a contract" % (cash_note, money(available), money(margin))})
+    else:
+        margin = None
+        margin_note = ("margin not checked: add your broker's margin for %s as \"futures_margin_usd\": "
+                       "{\"%s\": ...} in the config" % (spec["root"], spec["root"]))
+    qty = max(0, min(l["shares"] for l in limits))
+    bound = [l["name"] for l in limits if l["shares"] == qty]
+    for l in limits:
+        l["binds"] = l["name"] == bound[0]
+    loss = round(qty * per_c / 100.0, 2)
+    refusal = None
+    if qty == 0:
+        if bound[0] == "max loss":
+            micro = MICRO.get(sym)
+            refusal = ("one %s contract risks %s (%s points x %s), more than your %s max loss per trade. No order. "
+                       "Skip this trade, plan a closer stop with trader-exit%s."
+                       % (spec["root"], money(per_c / 100.0), _pts(risk), money(pv), money(max_loss),
+                          (", or trade the micro, %s (%s a point)" % (FUTURES[micro]["root"],
+                                                                     money(FUTURES[micro]["point_value"])))
+                          if micro else ""))
+        elif bound[0] == "margin":
+            refusal = ("one %s contract needs %s margin, more than the %s you have after the buffer. No order."
+                       % (spec["root"], money(margin), money(available)))
+        else:
+            refusal = "max_contracts is 0 in your config. No order."
+    elif _f(c.get("min_reward_risk")) and reward_c < _f(c["min_reward_risk"]) * risk_c - EPS:
+        refusal = ("reward:risk %.2f (target %s, entry %s, stop %s) is under your minimum %s, so trader-risk "
+                   "would block it. No order. Skip it, or make a new plan with trader-exit."
+                   % (reward_c / float(risk_c), _price(target), _price(ref), _price(stop), _num(c["min_reward_risk"])))
+    return {
+        "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
+        "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
+        "entry": ref, "entry_from": ref_from, "stop": stop, "target": target,
+        "risk_per_share": risk, "reward_risk": round(reward_c / float(risk_c), 2),
+        "stop_label": plan.get("stop_label", ""), "target_label": plan.get("target_label", ""),
+        "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
+        "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
+        "cost": round(qty * margin, 2) if margin else None, "max_loss": loss,
+        "flat_by": plan.get("flat_by") or c.get("flat_by"),
+        "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+        "contract": dict(spec, symbol=sym), "risk_per_contract_usd": per_c / 100.0,
+        "margin_per_contract": margin, "margin_note": margin_note,
+    }
+
+
 def bracket_order(s):
-    """The one proposed order, Alpaca place_stock_order fields (strings) plus why and plan."""
+    """The one proposed order, Alpaca place_stock_order fields (strings) plus why and plan.
+    A future's order carries asset_class "future" and its contract: it is for your futures broker."""
     if s["refusal"] or s["qty"] <= 0:
         return None
+    if s.get("contract"):
+        return _future_order(s)
     o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
          "time_in_force": "day"}
     if s["order_type"] == "limit":
@@ -441,7 +548,80 @@ def bracket_order(s):
     return o
 
 
+def _future_order(s):
+    k = s["contract"]
+    o = {"symbol": s["symbol"], "asset_class": "future", "side": "buy", "qty": str(int(s["qty"])),
+         "type": s["order_type"], "time_in_force": "day"}
+    if s["order_type"] == "limit":
+        o["limit_price"] = _price(s["entry"])
+    setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
+    bound = {"max loss": "%s max loss per trade" % money(s["max_loss_per_trade_usd"] or 0),
+             "max contracts": "max_contracts", "margin": "margin after the buffer"}[s["bound_by"]]
+    why = ("%s on %s (%s): %d contract%s, bound by your %s (%d x %s = %s at the stop)"
+           % (setup, k["root"], k["name"], s["qty"], "" if s["qty"] == 1 else "s", bound, s["qty"],
+              money(s["risk_per_contract_usd"]), money(s["max_loss"])))
+    o.update({
+        "order_class": "bracket",
+        "take_profit_limit_price": _price(s["target"]),
+        "stop_loss_stop_price": _price(s["stop"]),
+        "contract": k,
+        "why": why,
+        "plan": {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
+                 "risk_per_share": s["risk_per_share"], "risk_per_contract_usd": s["risk_per_contract_usd"],
+                 "point_value": k["point_value"], "max_loss": s["max_loss"], "setup": s["setup"],
+                 "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
+    })
+    return o
+
+
+def _future_report(s, order, notes):
+    k = s["contract"]
+    lines = []
+    setup = SETUP_WORDS.get(s["setup"], s["setup"] or "setup")
+    lines.append("%s (%s, %s) buy, %s, entry %s%s" % (k["root"], k["name"], s["symbol"], setup,
+                                                    _price(s["entry_plan"]),
+                                                    (" at " + s["entry_time"]) if s["entry_time"] else ""))
+    lines.append("Stop %s%s. Target %s%s." % (_price(s["stop"]), (": " + s["stop_label"]) if s["stop_label"] else "",
+                                             _price(s["target"]),
+                                             (": " + s["target_label"]) if s["target_label"] else ""))
+    for n in notes:
+        lines.append(n)
+    lines.append("Risk %s points a contract x %s a point = %s a contract. Reward:risk %.2f."
+                 % (_pts(s["risk_per_share"]), money(k["point_value"]), money(s["risk_per_contract_usd"]),
+                    s["reward_risk"]))
+    lines.append("")
+    lines.append("Limits (whole contracts; the smallest one wins):")
+    for l in s["limits"]:
+        lines.append("  %-13s %-62s %3d%s" % (l["name"], l["how"], l["shares"], "  <- binds" if l["binds"] else ""))
+    if s["margin_note"]:
+        lines.append("  Note: " + s["margin_note"] + ".")
+    lines.append("")
+    if order is None:
+        lines.append("No order: " + s["refusal"])
+        lines.append("Education and tooling, not financial advice.")
+        return "\n".join(lines)
+    lines.append("Size: %d %s contract%s. Max loss at the stop: %d x %s = %s."
+                 % (s["qty"], k["root"], "" if s["qty"] == 1 else "s", s["qty"], money(s["risk_per_contract_usd"]),
+                    money(s["max_loss"])))
+    lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
+    lines.append("")
+    lines.append("Proposed bracket order for your futures broker (Alpaca does not trade futures; nothing has been placed):")
+    how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
+    lines.append("  buy %s %s (front month), %s, day, take-profit %s, stop-loss %s"
+                 % (order["qty"], k["root"], how, order["take_profit_limit_price"], order["stop_loss_stop_price"]))
+    lines.append("Yahoo's %s is the continuous front-month contract: check your broker's front-month price before "
+                 "you enter, it can differ near a roll." % s["symbol"])
+    if s["flat_by"]:
+        lines.append("Flat by %s New York: anything still open then gets closed." % s["flat_by"])
+    lines.append("")
+    lines.append("Next: trader-risk checks it, then trader-broker shows the ticket for you to place yourself.")
+    lines.append("Education and tooling, not financial advice.")
+    return "\n".join(lines)
+
+
 def plan_report(s, order, notes=()):
+    if s.get("contract"):
+        return _future_report(s, order, notes)
     lines = []
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "setup")
     lines.append("%s buy, %s, entry %s%s" % (s["symbol"], setup, _price(s["entry_plan"]),

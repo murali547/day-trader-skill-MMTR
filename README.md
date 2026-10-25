@@ -152,6 +152,41 @@ for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.
 
+## Futures: NQ and GC
+
+The intraday half of the pack also works on four futures, by Yahoo's
+continuous front-month symbols: `NQ=F` (E-mini Nasdaq-100, $20 a point),
+`MNQ=F` (the micro, $2 a point), `GC=F` (gold, $100 a point) and `MGC=F`
+(micro gold, $10 a point).
+
+```bash
+python3 trader-entry/entry.py check NQ=F --setup orb --write           # the 9:30 opening range, as for a stock
+python3 trader-exit/exit.py plan --stop or-mid --target 1R --write     # stop and target snap to the tick
+python3 trader-timemachine/timemachine.py run --write                  # odds from NQ's own 9:30-4:00 bars
+python3 trader-budget/size.py --write                                  # whole contracts, sized to your max loss
+python3 trader-risk/check.py                                           # needs "allow_futures": true
+python3 trader-broker/ticket.py show                                   # a MANUAL ticket for your futures broker
+```
+
+- **Sizing.** One contract risks (entry minus stop) x its dollars a point.
+  A 73.5-point NQ stop is $1,470 a contract, $147 on MNQ. With the default
+  $50 max loss neither fits, and trader-budget says so instead of
+  shrinking the trade. `max_contracts` (default 1) caps the count, and
+  `"futures_margin_usd": {"MNQ": 2500}` (your broker's number; margins
+  change, so the pack ships none) lets it check margin against your cash.
+- **Risk.** Futures are blocked until you set `"allow_futures": true`. The
+  max loss, daily loss and reward:risk rules work in dollars, the same as
+  for a stock. The share-price rules (min and max order, position cap) are
+  skipped, because a contract's face value is not what you pay to hold it.
+- **Placing it.** Alpaca does not trade futures, so the ticket is never
+  READY: once trader-risk passes it, it shows MANUAL, with the contract,
+  the bracket and the max loss for you to place at your futures broker.
+- **The session.** Every tool looks at 9:30 to 4:00 New York time and the
+  NYSE calendar, even though the contracts trade nearly around the clock.
+  Gold's own day opens at 8:20, so a 9:30 range on GC is the stock market's
+  open, not gold's. The scanner, news, analyst and Pelosi tools are for
+  stocks only.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does

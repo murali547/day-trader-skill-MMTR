@@ -21,6 +21,12 @@ work around the one moment that matters, your yes:
             flat_by. It still goes through trader-risk and your yes.
   log       prints today's decisions.
 
+Futures (an order with "asset_class": "future", from trader-budget for NQ=F,
+MNQ=F, GC=F or MGC=F) are never READY: Alpaca does not trade futures and the
+pack has no futures connector. The ticket says MANUAL once trader-risk passed
+it: the contract, the bracket and the max loss in dollars, for you to place
+yourself at your futures broker.
+
     python3 ticket.py show                    # every order, READY or not
     python3 ticket.py show --index 1 --json   # one ticket as JSON
     python3 ticket.py approve --index 1 --reply "yes"
@@ -192,6 +198,15 @@ def is_bracket(order):
     return oc == "bracket" or (not oc and legs)
 
 
+def is_future(order):
+    return str(order.get("asset_class") or "").lower() == "future"
+
+
+def point_value(order):
+    k = order.get("contract") if isinstance(order.get("contract"), dict) else {}
+    return _f(k.get("point_value")) or _f((order.get("plan") or {}).get("point_value")) or 1.0
+
+
 def max_loss(order):
     """(dollars, stop) lost if the stop fills exactly at the stop, or (None, stop)."""
     stop = _f(order.get("stop_loss_stop_price")) or _f((order.get("plan") or {}).get("stop"))
@@ -208,7 +223,7 @@ def max_loss(order):
     if not entry:
         return None, stop
     risk = abs(entry - stop)
-    return round(q * int(round(risk * 100)) / 100.0, 2), stop
+    return round(q * int(round(risk * 100)) * point_value(order) / 100.0, 2), stop
 
 
 def plain_parts(order):
@@ -219,7 +234,13 @@ def plain_parts(order):
     tif = TIF_WORDS.get(str(order.get("time_in_force", "day")), order.get("time_in_force"))
     if is_bracket(order):
         how = "limit %s" % _p(order["limit_price"]) if typ == "limit" and order.get("limit_price") else typ
-        parts = ["%s %s %s, %s, %s" % (side, _str_num(order.get("qty")), sym, how, tif)]
+        if is_future(order):
+            k = order.get("contract") or {}
+            q = _str_num(order.get("qty"))
+            parts = ["%s %s %s contract%s (%s, front month), %s, %s"
+                     % (side, q, k.get("root", sym), "" if q == "1" else "s", k.get("name", sym), how, tif)]
+        else:
+            parts = ["%s %s %s, %s, %s" % (side, _str_num(order.get("qty")), sym, how, tif)]
         if order.get("stop_loss_stop_price") is not None:
             leg = "stop-loss %s" % _p(order["stop_loss_stop_price"])
             if order.get("stop_loss_limit_price") is not None:
@@ -331,6 +352,9 @@ def status_of(order, risk, state, today):
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
         return False, "BLOCKED by trader-risk: " + "; ".join(rv.get("reasons", [])), rv
+    if is_future(order):
+        return False, ("MANUAL: trader-risk PASS. Alpaca does not trade futures, so place this one yourself "
+                       "at your futures broker"), rv
     rec = latest(state, fp, today)
     if rec:
         st = rec.get("status")
@@ -354,7 +378,10 @@ def render(order, idx, total, cfg, risk, state, today):
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    where = "Interactive Brokers" if broker == "ibkr" else "Alpaca"
+    if is_future(order):
+        acct, where = "FUTURES", "your futures broker, placed by you"
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, where)]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -362,7 +389,11 @@ def render(order, idx, total, cfg, risk, state, today):
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
+    if is_future(order):
+        lines.append("  Place it as one bracket order at your futures broker: the entry, then the stop-loss")
+        lines.append("  and the take-profit as two orders that cancel each other. Check the front-month price")
+        lines.append("  there first: Yahoo's continuous contract can differ from it near a roll.")
+    elif broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
@@ -384,8 +415,8 @@ def ticket_json(order, idx, cfg, risk, state, today):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
-            "tool_input": tool_input(order), "why": order.get("why", ""),
+            "broker": cfg.get("broker", "alpaca"), "tool": None if is_future(order) else "place_stock_order",
+            "tool_input": None if is_future(order) else tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
 

@@ -27,6 +27,8 @@ What blocks an order (every order):
   asset         options (OCC symbols) unless "allow_options": true; crypto
                 and anything that is not a stock or ETF
   short         selling more than you hold, unless "allow_short": true
+  future        a futures order (NQ=F, MNQ=F, GC=F, MGC=F) unless
+                "allow_futures": true; any other =F symbol (no contract specs)
 
 What blocks an entry (on top):
 
@@ -54,6 +56,13 @@ What blocks an entry (on top):
   pdt           only with "pdt_guard": true: 3 day trades already in the last
                 5 business days (a 4th would trip the old pattern-day-trader rule)
 
+Futures. The loss is contracts x (entry - stop) x the contract's dollars a
+point ($20 NQ, $2 MNQ, $100 GC, $10 MGC), so the max loss, daily loss and
+reward:risk rules work in dollars as for a stock. min_order_usd, max_order_usd
+and max_position_pct are skipped (they measure what shares cost, not a
+contract's margin). The cash rule uses "futures_margin_usd" from the config
+when it names the contract, and warns that margin is unchecked when not.
+
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
 so trader-broker only shows an order as ready if THIS exact order passed today.
@@ -73,7 +82,14 @@ DEFAULTS = {
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "pdt_guard": False, "allow_futures": False,
+}
+# Futures by Yahoo symbol: dollars per 1.00 of price and the minimum tick (CME and COMEX specs).
+FUTURES = {
+    "NQ=F": {"root": "NQ", "name": "E-mini Nasdaq-100", "point_value": 20.0, "tick": 0.25},
+    "MNQ=F": {"root": "MNQ", "name": "Micro E-mini Nasdaq-100", "point_value": 2.0, "tick": 0.25},
+    "GC=F": {"root": "GC", "name": "Gold", "point_value": 100.0, "tick": 0.10},
+    "MGC=F": {"root": "MGC", "name": "Micro Gold", "point_value": 10.0, "tick": 0.10},
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -428,6 +444,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         legs = o.get("take_profit_limit_price") is not None or o.get("stop_loss_stop_price") is not None
         bracket = oc == "bracket" or (not oc and legs)
         value = None
+        spec = FUTURES.get(sym)
+        pv = spec["point_value"] if spec else 1.0
+        unit = "contract" if spec else "share"
 
         # format
         if not sym:
@@ -473,7 +492,17 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                          % (oc or "advanced_instructions"))
 
         # asset
-        if sym and OCC.match(sym.replace(" ", "")):
+        if spec:
+            if not c.get("allow_futures"):
+                reasons.append("future: %s is a futures contract (%s); futures are off (\"allow_futures\": false)"
+                               % (sym, spec["name"]))
+            else:
+                warns.append("futures order: %s, %s a point; place it at your futures broker" % (spec["root"],
+                                                                                              money(pv)))
+        elif sym.endswith("=F"):
+            reasons.append("future: %s has no contract specs in this pack (it knows %s)"
+                           % (sym, ", ".join(sorted(FUTURES))))
+        elif sym and OCC.match(sym.replace(" ", "")):
             if not c.get("allow_options"):
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
@@ -505,7 +534,19 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             warns.append("the %s price in trader/prices.json is older than %d minutes: not used"
                          % (sym, FRESH_MINUTES))
         q = _f(qty)
-        if notional is not None and _f(notional):
+        margin = None
+        if spec:
+            margins = c.get("futures_margin_usd") or {}
+            if isinstance(margins, dict):
+                margin = _f(margins.get(spec["root"], margins.get(sym)))
+            if notional is not None:
+                reasons.append("format: a futures order needs a qty in contracts, not a notional amount")
+            elif q and margin:
+                value = q * margin                 # what holding it ties up, not its face value
+            elif q and side == "buy":
+                warns.append("margin not checked: add your broker's margin for %s as \"futures_margin_usd\": "
+                             "{\"%s\": ...} in the config" % (spec["root"], spec["root"]))
+        elif notional is not None and _f(notional):
             value = _f(notional)
         elif q:
             if ref:
@@ -523,14 +564,14 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         elif side == "buy" and held < -1e-9 and q is not None:
             exiting = q <= -held + 1e-9
         kind = "exit" if exiting else "entry"
-        if kind == "entry" and value is None and q:
+        if kind == "entry" and value is None and q and not spec:
             later.append("price: no price for %s to size a %s-share order; add it to "
                          "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
 
         # blocked list and size
         if sym in blocked:
             later.append("blocked: %s is on your blocked list" % sym)
-        if value is not None:
+        if value is not None and not spec:
             if value < float(c.get("min_order_usd") or 0) - CENT:
                 later.append("size: %s is under your %s minimum order"
                              % (money(value), money(c["min_order_usd"])))
@@ -552,7 +593,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                              % (money(max(after_cash, 0)), _pct(c["cash_buffer_pct"]), money(buffer_usd)))
             pos_after = held_value + value
             limit = total * float(c.get("max_position_pct") or 100) / 100.0
-            if total > 0 and pos_after > limit + CENT:
+            if total > 0 and pos_after > limit + CENT and not spec:
                 later.append("position: %s would be %s, %.1f%% of the %s account, over your %s%% cap"
                              % (sym, money(pos_after), 100.0 * pos_after / total, money(total),
                                 _pct(c["max_position_pct"])))
@@ -594,9 +635,13 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     risk_c = int(round(abs(ref - stop) * 100))
                     risk_ps = risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
-                    max_loss = round(shares * risk_ps, 2)
+                    max_loss = round(shares * risk_c * pv / 100.0, 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
-                    if cap and max_loss > cap + CENT:
+                    if cap and max_loss > cap + CENT and spec:
+                        later.append("loss: %s contracts x %s points x %s a point = %s at the stop, over your %s "
+                                     "max loss per trade" % (_num(shares), _num(risk_ps), money(pv), money(max_loss),
+                                                             money(cap)))
+                    elif cap and max_loss > cap + CENT:
                         later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
                                      "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
@@ -629,9 +674,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
                              % (pdt_n, ", ".join(pdt_list)))
             if stop and ref and risk_ps:
-                info.append("entry %s (%s), stop %s, target %s: risk %s a share"
+                info.append("entry %s (%s), stop %s, target %s: risk %s"
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
-                               _p(target) if target else "none", _p(risk_ps)))
+                               _p(target) if target else "none",
+                               ("%s points, %s a contract" % (_num(risk_ps), money(risk_ps * pv))) if spec
+                               else "%s a share" % _p(risk_ps)))
                 info.append("max loss %s%s, reward:risk %s%s"
                             % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
@@ -683,7 +730,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held - value / ref
         results.append({
             "index": i, "symbol": sym, "side": side, "kind": kind,
-            "amount": money(_f(notional) or 0) if notional is not None else ("%s shares" % qty),
+            "amount": money(_f(notional) or 0) if notional is not None else ("%s %ss" % (qty, unit)),
             "value_usd": round(value, 2) if value is not None else None,
             "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,

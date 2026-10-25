@@ -87,6 +87,13 @@ SESSION_BARS = 78    # 9:30 to 16:00 in 5-minute bars
 OPEN_MIN = 9 * 60 + 30
 CLOSE_MIN = 16 * 60
 MIN_SESSIONS = 20
+# Futures by Yahoo symbol: dollars per 1.00 of price and the minimum tick (CME and COMEX specs).
+FUTURES = {
+    "NQ=F": {"root": "NQ", "name": "E-mini Nasdaq-100", "point_value": 20.0, "tick": 0.25},
+    "MNQ=F": {"root": "MNQ", "name": "Micro E-mini Nasdaq-100", "point_value": 2.0, "tick": 0.25},
+    "GC=F": {"root": "GC", "name": "Gold", "point_value": 100.0, "tick": 0.10},
+    "MGC=F": {"root": "MGC", "name": "Micro Gold", "point_value": 10.0, "tick": 0.10},
+}
 SAMPLE_PATHS = 160
 BAND_PATHS = 2000
 BAND_Q = (0.05, 0.25, 0.5, 0.75, 0.95)
@@ -531,7 +538,7 @@ def load_plan(a, now_utc):
 def normalize_plan(raw, src="flags"):
     """A plan dict (trader/plan.json shape) -> the checked plan the time machine runs."""
     sym = str(raw.get("symbol") or "").strip().upper()
-    if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", sym):
+    if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}(=F)?$", sym):
         raise TMError("the plan needs a ticker symbol, got %r" % raw.get("symbol"))
     side = str(raw.get("side") or "buy").lower()
     if side not in ("buy", "sell"):
@@ -588,6 +595,7 @@ def normalize_plan(raw, src="flags"):
         "opening_range": dict(orng, minutes=or_min) if isinstance(orng, dict) else {"minutes": or_min},
         "stop_rule": str(raw.get("stop_rule") or "auto"), "interval": "5m",
         "flat_by": raw.get("flat_by"), "from": src,
+        "point_value": (FUTURES.get(sym) or {}).get("point_value"),
     }
 
 
@@ -765,10 +773,13 @@ def report(doc):
     until = clock12(int(m["until"][:2]) * 60 + int(m["until"][3:]))
     wd = WEEKDAYS[datetime.date.fromisoformat(p["date"]).weekday()]
     r = p["target_r"]
+    pv = p.get("point_value")
+    risk_words = ("risk %.2f points, $%s a contract" % (p["risk_per_share"], "{:,.2f}".format(p["risk_per_share"] * pv))
+                  if pv else "risk %.2f a share" % p["risk_per_share"])
     lines = [
-        "%s %s, %s %s: entry %.2f at %s (bar %d), stop %.2f, target %.2f (%sR, risk %.2f a share)."
+        "%s %s, %s %s: entry %.2f at %s (bar %d), stop %.2f, target %.2f (%sR, %s)."
         % (p["symbol"], p["side"], wd, p["date"], p["entry"], p["entry_time"], p["entry_bar"], p["stop"],
-           p["target"], ("%g" % r), p["risk_per_share"]),
+           p["target"], ("%g" % r), risk_words),
         "%s replays of the rest of the session, %s to %s (%d five-minute bars), seed %d."
         % ("{:,}".format(m["replays"]), p["entry_time"], until, m["bars_left"], m["seed"]),
         "Each bar is drawn whole from %s's own 5-min bars at the same time of day (+-%d bars) over its last "
